@@ -11,92 +11,34 @@ from utils import log_triton_kernel
 
 
 @triton.jit
-def send_signal(addrs, sem: tl.constexpr):
-    if sem == "relaxed":
-        tl.inline_asm_elementwise(
-            """
-            {
-                .reg .u32   %tmp32_<1>;
-                .reg .pred  %p<1>;
+def test_barrier(addrs, expect, target, sem: tl.constexpr):
+    barrier_value = tl.atomic_cas(addrs, expect, target, sem=sem, scope="sys")
 
-                send_signal:
-                    atom.global.relaxed.sys.cas.b32 %tmp32_0, [$1], 0, 1;
-                    setp.eq.u32 %p0, %tmp32_0, 0;
-                    @!%p0 bra send_signal;
-            }
-            """,
-            "=r, l",
-            [addrs],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-    elif sem == "acq_rel":
-        tl.inline_asm_elementwise(
-            """
-            {
-                .reg .u32   %tmp32_<1>;
-                .reg .pred  %p<1>;
 
-                send_signal:
-                    atom.global.release.sys.cas.b32 %tmp32_0, [$1], 0, 1;
-                    setp.eq.u32 %p0, %tmp32_0, 0;
-                    @!%p0 bra send_signal;
-            }
-            """,
-            "=r, l",
-            [addrs],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-    else:
-        raise RuntimeError(f"Unrecognized sem: {sem}")
+    passed = barrier_value == expect
+    # if some failed: [0, 0, 0, 0, 1, 0, 0, 0]
+    # if all passed: [0, 0, 0, 0, 0, 0, 0, 0]
+    all_passed = tl.min(passed.to(tl.int1))
+
+
+    return all_passed
 
 
 @triton.jit
-def wait_signal(addrs, sem: tl.constexpr):
-    if sem == "relaxed":
-        tl.inline_asm_elementwise(
-            """
-            {
-                .reg .u32   %tmp32_<1>;
-                .reg .pred  %p<1>;
+def send_signal(addrs, sem: tl.constexpr, WORLD_SIZE: tl.constexpr):
+    zeros = tl.zeros((WORLD_SIZE,), dtype=tl.uint32)
+    ones = tl.full((WORLD_SIZE,), 1, dtype=tl.uint32)
+    while not test_barrier(addrs, zeros, ones, sem).to(tl.int1):
+        pass
 
-                wait_signal:
-                    atom.global.sys.relaxed.cas.b32 %tmp32_0, [$1], 1, 0;
-                    setp.eq.u32 %p0, %tmp32_0, 1;
-                    @!%p0 bra wait_signal;
-            }
-            """,
-            "=r, l",
-            [addrs],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-    elif sem == "acq_rel":
-        tl.inline_asm_elementwise(
-            """
-            {
-                .reg .u32   %tmp32_<1>;
-                .reg .pred  %p<1>;
 
-                wait_signal:
-                    atom.global.sys.acquire.cas.b32 %tmp32_0, [$1], 1, 0;
-                    setp.eq.u32 %p0, %tmp32_0, 1;
-                    @!%p0 bra wait_signal;
-            }
-            """,
-            "=r, l",
-            [addrs],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-    else:
-        raise RuntimeError(f"Unrecognized sem: {sem}")
 
+@triton.jit
+def wait_signal(addrs, sem: tl.constexpr, WORLD_SIZE: tl.constexpr):
+    zeros = tl.zeros((WORLD_SIZE,), dtype=tl.uint32)
+    ones = tl.full((WORLD_SIZE,), 1, dtype=tl.uint32)
+    while not test_barrier(addrs, ones, zeros, sem).to(tl.int1):
+        pass
 
 @triton.jit
 def blockwise_barrier(
@@ -140,7 +82,6 @@ def blockwise_barrier(
     """
     if block_id is None:
         block_id = get_flat_bid()
-    flat_tid = get_flat_tid()
 
     remote_ranks = tl.arange(0, world_size)
     signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
@@ -154,9 +95,9 @@ def blockwise_barrier(
     )
     wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
 
-    if flat_tid < world_size:
-        send_signal(send_addrs, sem)
-        wait_signal(wait_addrs, sem)
+    if get_flat_tid() < world_size:
+        send_signal(send_addrs, sem, world_size)
+        wait_signal(wait_addrs, sem, world_size)
 
 
 @triton.jit
@@ -168,11 +109,10 @@ def barrier_test_kernel(
     blockwise_barrier(signal_pad_ptrs, None, rank, world_size, "relaxed")
     sync_threads()
 
-
 def barrier_test(t: torch.Tensor) -> None:
     symm_mem_hdl = symm_mem.rendezvous(t, group=dist.group.WORLD)
 
-    kernel = barrier_test_kernel[(32, 1, 1)](
+    kernel = barrier_test_kernel[(1, 1, 1)](
         symm_mem_hdl.signal_pad_ptrs_dev,
         rank=symm_mem_hdl.rank,
         world_size=symm_mem_hdl.world_size,
